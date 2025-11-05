@@ -1,71 +1,130 @@
-#include  <stdio.h>
-#include  <stdlib.h>
-#include  <sys/types.h>
-#include  <sys/ipc.h>
-#include  <sys/shm.h>
+#define _XOPEN_SOURCE 700
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
+#include <errno.h>
 
-void  ClientProcess(int []);
+typedef struct {
+    int BankAccount;  // shared account balance
+    int Turn;         // 0 = Parent's turn, 1 = Child's turn
+} Shared;
 
-int  main(int  argc, char *argv[])
-{
-     int    ShmID;
-     int    *ShmPTR;
-     pid_t  pid;
-     int    status;
-
-     if (argc != 5) {
-          printf("Use: %s #1 #2 #3 #4\n", argv[0]);
-          exit(1);
-     }
-
-     ShmID = shmget(IPC_PRIVATE, 4*sizeof(int), IPC_CREAT | 0666);
-     if (ShmID < 0) {
-          printf("*** shmget error (server) ***\n");
-          exit(1);
-     }
-     printf("Server has received a shared memory of four integers...\n");
-
-     ShmPTR = (int *) shmat(ShmID, NULL, 0);
-     if (*ShmPTR == -1) {
-          printf("*** shmat error (server) ***\n");
-          exit(1);
-     }
-     printf("Server has attached the shared memory...\n");
-
-     ShmPTR[0] = atoi(argv[1]);
-     ShmPTR[1] = atoi(argv[2]);
-     ShmPTR[2] = atoi(argv[3]);
-     ShmPTR[3] = atoi(argv[4]);
-     printf("Server has filled %d %d %d %d in shared memory...\n",
-            ShmPTR[0], ShmPTR[1], ShmPTR[2], ShmPTR[3]);
-
-     printf("Server is about to fork a child process...\n");
-     pid = fork();
-     if (pid < 0) {
-          printf("*** fork error (server) ***\n");
-          exit(1);
-     }
-     else if (pid == 0) {
-          ClientProcess(ShmPTR);
-          exit(0);
-     }
-
-     wait(&status);
-     printf("Server has detected the completion of its child...\n");
-     shmdt((void *) ShmPTR);
-     printf("Server has detached its shared memory...\n");
-     shmctl(ShmID, IPC_RMID, NULL);
-     printf("Server has removed its shared memory...\n");
-     printf("Server exits...\n");
-     exit(0);
+static int rand_range(int lo, int hi_inclusive) {
+    // returns a random int in [lo, hi_inclusive]
+    return lo + (rand() % (hi_inclusive - lo + 1));
 }
 
-void  ClientProcess(int  SharedMem[])
-{
-     printf("   Client process started\n");
-     printf("   Client found %d %d %d %d in shared memory\n",
-                SharedMem[0], SharedMem[1], SharedMem[2], SharedMem[3]);
-     printf("   Client is about to exit\n");
+int main(void) {
+    // Create shared memory (private to this process family)
+    int shmid = shmget(IPC_PRIVATE, sizeof(Shared), IPC_CREAT | 0600);
+    if (shmid < 0) {
+        perror("shmget");
+        return 1;
+    }
+
+    // Attach in parent
+    Shared *ShmPTR = (Shared *)shmat(shmid, NULL, 0);
+    if (ShmPTR == (void *)-1) {
+        perror("shmat (parent)");
+        // If attach fails, try to remove the segment
+        shmctl(shmid, IPC_RMID, NULL);
+        return 1;
+    }
+
+    // Initialize shared state
+    ShmPTR->BankAccount = 0;
+    ShmPTR->Turn = 0; // Parent goes first
+
+    // Seed RNG for parent; child will reseed after fork with its pid
+    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        // cleanup
+        shmdt(ShmPTR);
+        shmctl(shmid, IPC_RMID, NULL);
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* ----------------------- CHILD: Poor Student ----------------------- */
+        // Child inherits the already-attached ShmPTR (no extra shmget/shmat)
+        srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+
+        for (int i = 0; i < 25; i++) {
+            sleep(rand_range(0, 5));
+
+            // Busy wait until it's the child's turn (Turn == 1)
+            while (ShmPTR->Turn != 1) {
+                // no-op; strict alternation as required
+            }
+
+            int account = ShmPTR->BankAccount;
+
+            int need = rand_range(0, 50);
+            printf("Poor Student needs $%d\n", need);
+
+            if (need <= account) {
+                account -= need;
+                printf("Poor Student: Withdraws $%d / Balance = $%d\n", need, account);
+            } else {
+                printf("Poor Student: Not Enough Cash ($%d)\n", account);
+            }
+
+            // Write back to shared memory & pass turn to parent
+            ShmPTR->BankAccount = account;
+            ShmPTR->Turn = 0;
+        }
+
+        // Child done
+        _exit(0);
+    } else {
+        /* --------------------- PARENT: Dear Old Dad ----------------------- */
+        for (int i = 0; i < 25; i++) {
+            sleep(rand_range(0, 5));
+
+            // Busy wait until it's the parent's turn (Turn == 0)
+            while (ShmPTR->Turn != 0) {
+                // no-op; strict alternation as required
+            }
+
+            int account = ShmPTR->BankAccount;
+
+            if (account <= 100) {
+                // Try to deposit
+                int balance = rand_range(0, 100);
+                if (balance % 2 == 0) {
+                    account += balance;
+                    printf("Dear old Dad: Deposits $%d / Balance = $%d\n", balance, account);
+                } else {
+                    printf("Dear old Dad: Doesn't have any money to give\n");
+                }
+            } else {
+                printf("Dear old Dad: Thinks Student has enough Cash ($%d)\n", account);
+            }
+
+            // Write back to shared memory & pass turn to child
+            ShmPTR->BankAccount = account;
+            ShmPTR->Turn = 1;
+        }
+
+        // Wait for child, then cleanup shared memory
+        int status = 0;
+        waitpid(pid, &status, 0);
+
+        if (shmdt(ShmPTR) == -1) {
+            perror("shmdt (parent)");
+        }
+        if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+            perror("shmctl IPC_RMID");
+        }
+
+        return 0;
+    }
 }
